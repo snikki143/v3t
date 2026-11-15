@@ -1,0 +1,79 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="robots" content="noindex, nofollow">
+<title>Admin · Our Chat</title>
+<link rel="stylesheet" href="/admin.css">
+</head>
+<body>
+  <div id="loginScreen" class="login-wrap">
+    <form id="loginForm" class="card login-card">
+      <h1>Admin panel</h1>
+      <p class="sub">Not part of the chat app. Keep this password secret.</p>
+      <label for="pw">Admin password</label>
+      <input id="pw" type="password" autocomplete="current-password" required>
+      <button type="submit" class="primary block" id="loginBtn">Log in</button>
+      <div id="loginErr" class="err"></div>
+    </form>
+  </div>
+
+  <div id="panel" class="wrap hidden">
+    <div class="topbar">
+      <div><h1>Admin panel</h1><p class="sub" style="margin:0">Our Chat</p></div>
+      <button id="logoutBtn">Log out</button>
+    </div>
+
+    <div class="tabs">
+      <button id="tabUsers" class="active">Users</button>
+      <button id="tabChats">Chats</button>
+    </div>
+
+    <div id="usersCard" class="card">
+      <table><thead><tr><th>Username</th><th>Joined</th><th>Last seen</th><th>Chats</th><th>Status</th><th></th></tr></thead>
+        <tbody id="usersBody"></tbody>
+      </table>
+      <div id="usersEmpty" class="empty hidden">No users yet.</div>
+    </div>
+
+    <div id="chatsCard" class="card hidden">
+      <table><thead><tr><th>Between</th><th>Status</th><th>Messages</th><th>Last activity</th><th></th></tr></thead>
+        <tbody id="chatsBody"></tbody>
+      </table>
+      <div id="chatsEmpty" class="empty hidden">No chats yet.</div>
+    </div>
+
+    <div class="card danger-zone">
+      <h2>Danger zone</h2>
+      <p>Deletes every account and every conversation. This cannot be undone. Normal restarts (sleep, redeploy) never do this — only this button does.</p>
+      <button id="wipeBtn" class="danger">Delete all users &amp; chats</button>
+    </div>
+  </div>
+
+  <div id="chatModal" class="modal-backdrop hidden">
+    <div class="modal">
+      <h3 id="chatModalTitle">Conversation</h3>
+      <div id="chatModalBody"></div>
+      <button id="chatModalClose" style="margin-top:14px">Close</button>
+    </div>
+  </div>
+
+  <div id="pwModal" class="modal-backdrop hidden">
+    <div class="modal" style="width:min(380px,100%)">
+      <h3>Set a new password</h3>
+      <p class="muted" id="pwModalWho"></p>
+      <label for="pwNew">New password (8+ characters)</label>
+      <input id="pwNew" type="text" minlength="8" maxlength="100">
+      <div class="row-actions" style="margin-top:14px">
+        <button id="pwModalCancel">Cancel</button>
+        <button id="pwModalSave" class="primary">Save &amp; log them out everywhere</button>
+      </div>
+      <div id="pwModalErr" class="err"></div>
+    </div>
+  </div>
+
+  <div id="toast" class="toast"></div>
+  <script src="/admin.js"></script>
+</body>
+</html>

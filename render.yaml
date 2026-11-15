@@ -1,0 +1,18 @@
+# Render "Blueprint" for the FREE plan.
+# Free web services have no persistent disk, so chats are stored in a free Upstash Redis
+# database instead. You paste its URL and token in Render's dashboard (see README).
+services:
+  - type: web
+    name: our-chat-v2
+    runtime: node
+    plan: free
+    buildCommand: echo "nothing to build"
+    startCommand: node server.js
+    healthCheckPath: /healthz
+    envVars:
+      - key: TRUST_PROXY        # lets rate limits see each visitor's real IP behind Render's proxy
+        value: "1"
+      - key: UPSTASH_REDIS_REST_URL
+        sync: false             # you enter this in the Render dashboard
+      - key: UPSTASH_REDIS_REST_TOKEN
+        sync: false
