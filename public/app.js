@@ -1,0 +1,1487 @@
+(() => {
+  'use strict';
+
+  const $ = (id) => document.getElementById(id);
+  const el = {
+    login: $('login'), loginForm: $('loginForm'), loginError: $('loginError'), joinBtn: $('joinBtn'), joinLabel: $('joinLabel'),
+    tabLogin: $('tabLogin'), tabSignup: $('tabSignup'), formTitle: $('formTitle'), formSub: $('formSub'),
+    username: $('username'), password: $('password'), usernameHint: $('usernameHint'), passwordHint: $('passwordHint'),
+    chat: $('chat'), frame: $('frame'), meName: $('meName'), meAvatar: $('meAvatar'), logout: $('logoutBtn'),
+    search: $('search'), results: $('results'), listWrap: $('listWrap'),
+    requestsBlock: $('requestsBlock'), requests: $('requests'), requestsCount: $('requestsCount'),
+    chatList: $('chatList'), listEmpty: $('listEmpty'),
+    noChat: $('noChat'), convo: $('convo'), back: $('backBtn'),
+    peerName: $('peerName'), peerStatus: $('peerStatus'), peerAvatar: $('peerAvatar'),
+    audioCallBtn: $('audioCallBtn'), videoCallBtn: $('videoCallBtn'),
+    banner: $('banner'), requestBar: $('requestBar'), list: $('messages'), toBottom: $('toBottom'), unread: $('unreadCount'),
+    replyBar: $('replyBar'), replyName: $('replyName'), replySnippet: $('replySnippet'), replyCancel: $('replyCancel'),
+    photoPreview: $('photoPreview'), photoPreviewImg: $('photoPreviewImg'), photoCancel: $('photoCancel'),
+    photoBtn: $('photoBtn'), photoInput: $('photoInput'),
+    videoPreview: $('videoPreview'), videoPreviewEl: $('videoPreviewEl'), videoCancel: $('videoCancel'),
+    videoBtn: $('videoBtn'), videoInput: $('videoInput'),
+    deleteChatBtn: $('deleteChatBtn'), heartsOverlay: $('heartsOverlay'),
+    composer: $('composer'), input: $('input'), sendBtn: $('sendBtn'), toast: $('toast'),
+    callScreen: $('callScreen'), remoteVideo: $('remoteVideo'), localVideo: $('localVideo'),
+    callAvatarWrap: $('callAvatarWrap'), callAvatar: $('callAvatar'), callName: $('callName'), callStatus: $('callStatus'),
+    callIncoming: $('callIncoming'), callActive: $('callActive'),
+    callAccept: $('callAccept'), callDecline: $('callDecline'), callEnd: $('callEnd'), callMic: $('callMic'), callCam: $('callCam'),
+    lightbox: $('lightbox'), lightboxImg: $('lightboxImg'),
+    wallpaperBtn: $('wallpaperBtn'), wallpaperPicker: $('wallpaperPicker'), wallpaperSwatches: $('wallpaperSwatches'),
+    wallpaperUploadBtn: $('wallpaperUploadBtn'), wallpaperInput: $('wallpaperInput'), wallpaperResetBtn: $('wallpaperResetBtn'),
+    cameraBtn: $('cameraBtn'), cameraScreen: $('cameraScreen'), cameraVideo: $('cameraVideo'), cameraCanvas: $('cameraCanvas'),
+    cameraClose: $('cameraClose'), cameraFlip: $('cameraFlip'), cameraShutter: $('cameraShutter'),
+  };
+
+  const TITLE = 'Our Chat';
+  const coarse = matchMedia('(pointer: coarse)').matches; // phones/tablets: Enter = new line
+
+  const store = {
+    get(k) { try { return localStorage.getItem(k); } catch { return null; } },
+    set(k, v) { try { localStorage.setItem(k, v); } catch { /* private mode */ } },
+    del(k) { try { localStorage.removeItem(k); } catch { /* ignore */ } },
+  };
+
+  /* ------------------------------------------------------------------ state */
+  let token = store.get('chat.token');
+  let me = null;
+  let authMode = 'login';
+  let source = null;                  // EventSource
+  const chats = new Map();            // chatId -> summary from the server
+  const cache = new Map();            // chatId -> messages[] (sorted by id)
+  const loaded = new Set();           // chatIds whose history has been fetched
+  const lastSeenSent = new Map();     // chatId -> highest peer message id we reported as seen
+  const typingIn = new Map();         // chatId -> true while the peer is typing
+  const typingTimers = new Map();
+  let openId = null;                  // chat shown in the right panel
+  let nodes = new Map();              // message id -> { row, tick } for the open chat
+  let prev = null;                    // last rendered message (for grouping)
+  let lastPing = 0;
+  let recovering = false;
+  let iAmTyping = false;
+  let lastTypingSent = 0;
+  let typingStopTimer = null;
+  let toastTimer = null;
+  let searchTimer = null;
+  let searchSeq = 0;
+  let replyTarget = null;             // { id, from, text, photo, video } being replied to
+  let pendingPhoto = null;            // data URL staged to send with the next message
+  let pendingVideo = null;            // data URL staged to send with the next message
+
+  /* ---------------------------------------------------------------- helpers */
+  const fmtTime = (ts) => new Date(ts).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' });
+  const dayKey = (ts) => { const d = new Date(ts); return `${d.getFullYear()}-${d.getMonth()}-${d.getDate()}`; };
+  const yesterday = () => { const d = new Date(); d.setDate(d.getDate() - 1); return d; };
+
+  function dayLabel(ts) {
+    const k = dayKey(ts);
+    if (k === dayKey(Date.now())) return 'Today';
+    if (k === dayKey(yesterday())) return 'Yesterday';
+    const d = new Date(ts);
+    return d.toLocaleDateString([], { day: 'numeric', month: 'long', year: d.getFullYear() === new Date().getFullYear() ? undefined : 'numeric' });
+  }
+
+  function listTime(ts) {
+    const k = dayKey(ts);
+    if (k === dayKey(Date.now())) return fmtTime(ts);
+    if (k === dayKey(yesterday())) return 'Yesterday';
+    return new Date(ts).toLocaleDateString([], { day: 'numeric', month: 'short' });
+  }
+
+  function lastSeenText(ts) {
+    if (!ts) return 'offline';
+    if (Date.now() - ts < 60000) return 'last seen just now';
+    const k = dayKey(ts);
+    if (k === dayKey(Date.now())) return `last seen today at ${fmtTime(ts)}`;
+    if (k === dayKey(yesterday())) return `last seen yesterday at ${fmtTime(ts)}`;
+    return `last seen ${new Date(ts).toLocaleDateString([], { day: 'numeric', month: 'short' })}`;
+  }
+
+  function hue(s) { let h = 0; for (const c of s) h = (h * 31 + c.codePointAt(0)) % 360; return h; }
+  function paintAvatar(node, name) {
+    node.textContent = (Array.from(name.trim())[0] || '?').toUpperCase();
+    const h = hue(name);
+    node.style.background = `linear-gradient(135deg, hsl(${h} 70% 55%), hsl(${(h + 40) % 360} 70% 45%))`;
+  }
+  function avatar(name, cls) {
+    const a = document.createElement('div');
+    a.className = 'avatar' + (cls ? ' ' + cls : '');
+    a.setAttribute('aria-hidden', 'true');
+    paintAvatar(a, name);
+    return a;
+  }
+  function h(tag, cls, text) {
+    const n = document.createElement(tag);
+    if (cls) n.className = cls;
+    if (text != null) n.textContent = text;
+    return n;
+  }
+  function button(label, cls, onClick) {
+    const b = h('button', cls, label);
+    b.type = 'button';
+    b.addEventListener('click', (e) => { e.stopPropagation(); onClick(b); });
+    return b;
+  }
+
+  const TICK1 = '<svg viewBox="0 0 16 11" aria-label="Sent"><path d="M2 5.8 5.4 9.2 13.6 1.4"/></svg>';
+  const TICK2 = '<svg viewBox="0 0 16 11" aria-label="Seen"><path d="M1 5.8 4.4 9.2 11.6 1.6"/><path d="M7.2 9.2 14.8 1.6"/></svg>';
+  const REPLY_ICON = '<svg viewBox="0 0 24 24" aria-hidden="true"><path d="M10 7 4 13l6 6M4 13h9a6 6 0 0 1 6 6v1"/></svg>';
+
+  const URL_RE = /\bhttps?:\/\/[^\s<>"']+[^\s<>"'.,;:!?)\]}]/gi;
+  function linkify(node, text) {
+    let last = 0;
+    for (const m of text.matchAll(URL_RE)) {
+      if (m.index > last) node.append(text.slice(last, m.index));
+      const a = document.createElement('a');
+      a.href = m[0];
+      a.textContent = m[0];
+      a.target = '_blank';
+      a.rel = 'noopener noreferrer';
+      node.append(a);
+      last = m.index + m[0].length;
+    }
+    if (last < text.length) node.append(text.slice(last));
+  }
+
+  function toast(msg) {
+    el.toast.textContent = msg;
+    el.toast.classList.add('show');
+    clearTimeout(toastTimer);
+    toastTimer = setTimeout(() => el.toast.classList.remove('show'), 3500);
+  }
+
+  function setBanner(text) {
+    el.banner.textContent = text;
+    el.banner.classList.toggle('hidden', !text);
+  }
+
+  const visibleFocus = () => document.visibilityState === 'visible' && document.hasFocus();
+  const atBottom = () => el.list.scrollHeight - el.list.scrollTop - el.list.clientHeight < 80;
+  function scrollBottom(smooth) { el.list.scrollTo({ top: el.list.scrollHeight, behavior: smooth ? 'smooth' : 'auto' }); }
+
+  const totalUnread = () => { let n = 0; for (const c of chats.values()) if (c.status === 'active') n += c.unread; return n; };
+  function updateUnreadUi() {
+    const open = openId && chats.get(openId);
+    el.toBottom.classList.toggle('hidden', atBottom());
+    el.unread.textContent = open && open.unread ? String(open.unread) : '';
+    const n = totalUnread() + incoming().length;
+    document.title = n ? `(${n}) ${TITLE}` : TITLE;
+  }
+
+  /* -------------------------------------------------------------------- api */
+  async function api(path, body) {
+    const r = await fetch(path, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ token, ...body }),
+    });
+    let data = {};
+    try { data = await r.json(); } catch { /* non-JSON error page */ }
+    if (!r.ok) {
+      if (r.status === 401 && path !== '/api/login' && path !== '/api/signup') signOut('Your session has ended. Please log in again.');
+      const err = new Error(data.error || `Something went wrong (${r.status}).`);
+      err.status = r.status;
+      throw err;
+    }
+    return data;
+  }
+
+  /* ------------------------------------------------------------- chat list */
+  const incoming = () => [...chats.values()].filter((c) => c.status === 'pending' && c.requester !== me.id);
+  const byRecent = (a, b) => b.updated - a.updated;
+
+  function previewText(c) {
+    if (c.status === 'pending') return 'Request sent';
+    if (typingIn.get(c.id)) return 'typing…';
+    if (!c.last) return 'Say hi 👋';
+    if (c.last.photo) return (c.last.from === me.id ? 'You: ' : '') + '📷 Photo';
+    if (c.last.video) return (c.last.from === me.id ? 'You: ' : '') + '🎥 Video';
+    return (c.last.from === me.id ? 'You: ' : '') + c.last.text.replace(/\s+/g, ' ');
+  }
+
+  function renderList() {
+    if (!me) return;
+    const reqs = incoming().sort(byRecent);
+    el.requests.replaceChildren();
+    for (const c of reqs) el.requests.append(requestItem(c));
+    el.requestsBlock.classList.toggle('hidden', !reqs.length);
+    el.requestsCount.textContent = reqs.length ? String(reqs.length) : '';
+
+    const rest = [...chats.values()].filter((c) => c.status === 'active' || (c.status === 'pending' && c.requester === me.id)).sort(byRecent);
+    el.chatList.replaceChildren();
+    for (const c of rest) el.chatList.append(chatItem(c));
+    el.listEmpty.classList.toggle('hidden', !!(rest.length || reqs.length));
+    updateUnreadUi();
+  }
+
+  function chatItem(c) {
+    const item = h('div', 'item' + (c.id === openId ? ' active' : ''));
+    item.tabIndex = 0;
+    item.setAttribute('role', 'button');
+    const av = avatar(c.peer.username);
+    if (c.status === 'active' && c.peer.online) av.classList.add('on');
+    const body = h('div', 'item-body');
+    const top = h('div', 'item-top');
+    top.append(h('span', 'item-name', c.peer.username));
+    if (c.last) top.append(h('span', 'item-time', listTime(c.last.ts)));
+    const bottom = h('div', 'item-bottom');
+    bottom.append(h('span', 'item-preview' + (typingIn.get(c.id) ? ' typing' : ''), previewText(c)));
+    if (c.unread) bottom.append(h('span', 'item-badge', c.unread > 99 ? '99+' : String(c.unread)));
+    body.append(top, bottom);
+    item.append(av, body);
+    item.addEventListener('click', () => openChat(c.id));
+    item.addEventListener('keydown', (e) => { if (e.key === 'Enter' || e.key === ' ') { e.preventDefault(); openChat(c.id); } });
+    return item;
+  }
+
+  function requestItem(c) {
+    const item = h('div', 'item request' + (c.id === openId ? ' active' : ''));
+    item.append(avatar(c.peer.username));
+    const body = h('div', 'item-body');
+    body.append(h('div', 'item-name', c.peer.username), h('div', 'item-preview', 'wants to connect'));
+    const actions = h('div', 'item-actions');
+    actions.append(
+      button('Accept', 'mini primary-mini', (b) => respond(c.id, true, b)),
+      button('Decline', 'mini', (b) => respond(c.id, false, b)),
+    );
+    body.append(actions);
+    item.append(body);
+    item.addEventListener('click', () => openChat(c.id));
+    return item;
+  }
+
+  function upsertChat(c) {
+    const old = chats.get(c.id);
+    chats.set(c.id, c);
+    if (!old && c.status === 'pending' && c.requester !== me.id) {
+      toast(`${c.peer.username} wants to connect`);
+      notify(`${c.peer.username} wants to connect`, 'Open Our Chat to accept or decline.');
+    }
+    if (old && old.status === 'pending' && c.status === 'active' && c.requester === me.id) toast(`${c.peer.username} accepted your request`);
+    renderList();
+    if (c.id === openId) refreshConvo(old && old.status);
+  }
+
+  function removeChat(id) {
+    chats.delete(id); cache.delete(id); loaded.delete(id); lastSeenSent.delete(id); typingIn.delete(id);
+    if (openId === id) closeConvo();
+    renderList();
+  }
+
+  // an admin cleared this chat's messages — unlike removeChat, the connection stays, so the chat itself isn't removed
+  function clearChatLocal(d) {
+    cache.delete(d.chatId);
+    loaded.delete(d.chatId);
+    upsertChat(d.chat);
+    if (d.chatId === openId) toast('This conversation was cleared.');
+  }
+
+  async function respond(chatId, accept, btn) {
+    if (btn) btn.disabled = true;
+    try {
+      const r = await api('/api/respond', { chatId, accept });
+      upsertChat(r.chat);
+      if (!accept && openId === chatId) closeConvo();
+    } catch (err) { toast(err.message); if (btn) btn.disabled = false; }
+  }
+
+  async function cancelRequest(chatId, btn) {
+    if (btn) btn.disabled = true;
+    try { await api('/api/cancel', { chatId }); removeChat(chatId); }
+    catch (err) { toast(err.message); if (btn) btn.disabled = false; }
+  }
+
+  /* ----------------------------------------------------------------- search */
+  function clearSearch() {
+    el.search.value = '';
+    searchSeq++;
+    el.results.classList.add('hidden');
+    el.listWrap.classList.remove('hidden');
+    el.results.replaceChildren();
+  }
+
+  function onSearchInput() {
+    clearTimeout(searchTimer);
+    const q = el.search.value.trim().replace(/^@/, '');
+    if (!q) { clearSearch(); return; }
+    el.listWrap.classList.add('hidden');
+    el.results.classList.remove('hidden');
+    if (q.length < 2) { showResultsMessage('Keep typing… at least 2 characters.'); return; }
+    searchTimer = setTimeout(() => runSearch(q), 250);
+  }
+
+  function showResultsMessage(text) {
+    el.results.replaceChildren(h('div', 'results-msg', text));
+  }
+
+  async function runSearch(q) {
+    const seq = ++searchSeq;
+    try {
+      const r = await api('/api/search', { q });
+      if (seq !== searchSeq) return;
+      renderResults(r.users);
+    } catch (err) {
+      if (seq === searchSeq) showResultsMessage(err.message);
+    }
+  }
+
+  function renderResults(users) {
+    el.results.replaceChildren();
+    if (!users.length) { showResultsMessage('No one found with that username.'); return; }
+    el.results.append(h('div', 'section-label', 'PEOPLE'));
+    for (const u of users) {
+      const row = h('div', 'item');
+      row.append(avatar(u.username));
+      const body = h('div', 'item-body');
+      body.append(h('div', 'item-name', u.username));
+      row.append(body);
+      const act = h('div', 'result-action');
+      if (u.relation === 'connected') {
+        act.append(button('Message', 'mini primary-mini', () => { openChat(u.chatId); clearSearch(); }));
+      } else if (u.relation === 'incoming') {
+        act.append(button('Accept', 'mini primary-mini', async (b) => { await respond(u.chatId, true, b); openChat(u.chatId); clearSearch(); }));
+      } else if (u.relation === 'requested') {
+        act.append(h('span', 'tag', 'Requested'));
+      } else {
+        act.append(button('Connect', 'mini primary-mini', async (b) => {
+          b.disabled = true;
+          try {
+            const r = await api('/api/connect', { username: u.username });
+            upsertChat(r.chat);
+            act.replaceChildren(r.chat.status === 'active' ? button('Message', 'mini primary-mini', () => { openChat(r.chat.id); clearSearch(); }) : h('span', 'tag', 'Requested'));
+            toast(r.chat.status === 'active' ? `Connected with ${u.username}` : `Request sent to ${u.username}`);
+          } catch (err) { toast(err.message); b.disabled = false; }
+        }));
+      }
+      row.append(act);
+      el.results.append(row);
+    }
+  }
+
+  /* ------------------------------------------------------------ conversation */
+  function openChat(id) {
+    const c = chats.get(id);
+    if (!c) return;
+    if (openId && openId !== id) stopTyping();
+    openId = id;
+    nodes = new Map();
+    prev = null;
+    clearReply();
+    clearPhoto();
+    clearVideo();
+    closeWallpaperPicker();
+    el.list.replaceChildren();
+    el.noChat.classList.add('hidden');
+    el.convo.classList.remove('hidden');
+    el.frame.dataset.view = 'convo';
+    if (!history.state || !history.state.chat) history.pushState({ chat: 1 }, '');
+    renderHeader();
+    applyWallpaper(id);
+    refreshConvo();
+    renderList();
+    if (!coarse && c.status === 'active') el.input.focus();
+  }
+
+  function closeConvo() {
+    stopTyping();
+    closeWallpaperPicker();
+    openId = null;
+    el.convo.classList.add('hidden');
+    el.noChat.classList.remove('hidden');
+    el.frame.dataset.view = 'list';
+    renderList();
+  }
+
+  // (re)build everything that depends on the open chat's status
+  function refreshConvo(prevStatus) {
+    const c = chats.get(openId);
+    if (!c) return;
+    renderHeader();
+    const active = c.status === 'active';
+    el.composer.classList.toggle('hidden', !active);
+    el.audioCallBtn.classList.toggle('hidden', !active);
+    el.videoCallBtn.classList.toggle('hidden', !active);
+    renderRequestBar(c);
+    if (!active) {
+      el.list.replaceChildren(h('div', 'empty', c.requester === me.id
+        ? `Waiting for ${c.peer.username} to accept. You can chat once they do.`
+        : `${c.peer.username} wants to connect with you. Accept to start chatting.`));
+      return;
+    }
+    if (prevStatus && prevStatus !== 'active') { nodes = new Map(); prev = null; }
+    if (loaded.has(openId)) { renderAll(); scrollBottom(false); markSeen(); }
+    else loadMessages(openId);
+  }
+
+  function renderRequestBar(c) {
+    el.requestBar.replaceChildren();
+    if (c.status === 'active') { el.requestBar.classList.add('hidden'); return; }
+    el.requestBar.classList.remove('hidden');
+    if (c.requester === me.id) {
+      el.requestBar.append(h('span', null, `Request sent to ${c.peer.username}`), button('Cancel request', 'mini', (b) => cancelRequest(c.id, b)));
+    } else {
+      el.requestBar.append(
+        h('span', null, `${c.peer.username} wants to connect`),
+        button('Accept', 'mini primary-mini', (b) => respond(c.id, true, b)),
+        button('Decline', 'mini', (b) => respond(c.id, false, b)),
+      );
+    }
+  }
+
+  async function loadMessages(id) {
+    el.list.replaceChildren(h('div', 'empty', 'Loading…'));
+    try {
+      const r = await api('/api/messages', { chatId: id });
+      // merge with anything that arrived over the stream while we were loading
+      const got = cache.get(id) || [];
+      const map = new Map();
+      for (const m of r.messages) map.set(m.id, m);
+      for (const m of got) if (!map.has(m.id)) map.set(m.id, m);
+      const msgs = [...map.values()].sort((a, b) => a.id - b.id);
+      cache.set(id, msgs);
+      loaded.add(id);
+      lastSeenSent.set(id, msgs.reduce((hi, m) => (m.from !== me.id && m.seen ? Math.max(hi, m.id) : hi), 0));
+      if (id !== openId) return;
+      renderAll();
+      scrollBottom(false);
+      markSeen();
+    } catch (err) {
+      if (id === openId) el.list.replaceChildren(h('div', 'empty', err.message));
+    }
+  }
+
+  /* ----------------------------------------------------------------- header */
+  function renderHeader() {
+    const c = chats.get(openId);
+    if (!c) return;
+    el.peerName.textContent = c.peer.username;
+    paintAvatar(el.peerAvatar, c.peer.username);
+    const s = el.peerStatus;
+    s.replaceChildren();
+    if (c.status !== 'active') { s.className = 'status'; s.textContent = c.requester === me.id ? 'request pending' : 'wants to connect'; return; }
+    if (typingIn.get(c.id)) {
+      s.className = 'status typing';
+      s.append('typing');
+      const dots = h('span', 'dots');
+      dots.append(h('i'), h('i'), h('i'));
+      s.append(dots);
+    } else if (c.peer.online) {
+      s.className = 'status online';
+      s.textContent = 'online';
+    } else {
+      s.className = 'status';
+      s.textContent = lastSeenText(c.peer.lastSeen);
+    }
+  }
+
+  /* --------------------------------------------------------------- messages */
+  function renderAll() {
+    const msgs = cache.get(openId) || [];
+    el.list.replaceChildren();
+    nodes = new Map();
+    prev = null;
+    if (!msgs.length) { el.list.append(h('div', 'empty', 'No messages yet. Say hi 👋')); return; }
+    for (const m of msgs) appendMsg(m, false);
+  }
+
+  function findMsg(chatId, id) { return (cache.get(chatId) || []).find((m) => m.id === id); }
+
+  function quoteBlock(m) {
+    const q = h('div', 'quote');
+    const ref = findMsg(openId, m.replyTo);
+    if (!ref) { q.append(h('span', 'quote-missing', 'Original message unavailable')); return q; }
+    q.append(h('strong', null, ref.from === me.id ? 'You' : (chats.get(openId) || {}).peer?.username || ''));
+    q.append(h('span', null, ref.photo ? '📷 Photo' : ref.video ? '🎥 Video' : ref.text.slice(0, 80)));
+    q.addEventListener('click', (e) => { e.stopPropagation(); jumpTo(ref.id); });
+    return q;
+  }
+
+  function jumpTo(id) {
+    const n = nodes.get(id);
+    if (!n) return;
+    n.row.scrollIntoView({ block: 'center', behavior: 'smooth' });
+    n.row.classList.add('flash');
+    setTimeout(() => n.row.classList.remove('flash'), 900);
+  }
+
+  /* ------------------------------------------------------------- floating hearts */
+  // Instagram-style: a message that's just heart emoji (one or several, with or without
+  // spaces) sets off a little flurry of hearts rising up the conversation for both people.
+  const HEART_CHARS = '❤♥💕💖💗💓💞💘💝🧡💛💚💙💜🖤🤍🤎💔️';
+  function isHeartOnly(text) {
+    if (!text) return false;
+    const t = text.trim();
+    if (!t) return false;
+    let sawHeart = false;
+    for (const ch of t) {
+      if (ch === ' ') continue;
+      if (!HEART_CHARS.includes(ch)) return false;
+      if (ch !== '️') sawHeart = true;
+    }
+    return sawHeart;
+  }
+  const HEART_EMOJI = ['❤️', '🧡', '💛', '💚', '💙', '💜', '🩷', '🖤'];
+  function spawnHearts(count = 10) {
+    if (!el.heartsOverlay) return;
+    for (let i = 0; i < count; i++) {
+      const span = document.createElement('span');
+      span.className = 'floating-heart';
+      span.textContent = HEART_EMOJI[Math.floor(Math.random() * HEART_EMOJI.length)];
+      const x = 10 + Math.random() * 80; // vw-ish percent across the overlay
+      span.style.setProperty('--x', x + '%');
+      span.style.setProperty('--size', (16 + Math.random() * 20) + 'px');
+      span.style.setProperty('--dur', (2.4 + Math.random() * 1.6) + 's');
+      span.style.setProperty('--delay', (Math.random() * 0.5) + 's');
+      span.style.setProperty('--drift', (Math.random() * 60 - 30) + 'px');
+      span.style.setProperty('--rot-start', (Math.random() * 30 - 15) + 'deg');
+      span.style.setProperty('--rot-end', (Math.random() * 40 - 20) + 'deg');
+      el.heartsOverlay.append(span);
+      span.addEventListener('animationend', () => span.remove());
+      setTimeout(() => span.remove(), 6000); // safety net if animationend never fires
+    }
+  }
+
+  function appendMsg(m, animate) {
+    const empty = el.list.querySelector('.empty');
+    if (empty) empty.remove();
+
+    if (animate && !m.photo && !m.video && isHeartOnly(m.text)) spawnHearts();
+
+    if (!prev || dayKey(prev.ts) !== dayKey(m.ts)) {
+      el.list.append(h('div', 'day', dayLabel(m.ts)));
+      prev = null;
+    }
+
+    const mine = m.from === me.id;
+    const cont = !!prev && prev.from === m.from && m.ts - prev.ts < 120000 && !m.replyTo;
+    if (cont) { const p = nodes.get(prev.id); if (p) p.row.classList.remove('tail'); }
+
+    const row = h('div', `msg ${mine ? 'out' : 'in'} tail${cont ? ' cont' : ''}${animate ? ' pop' : ''}`);
+    row.dataset.id = m.id;
+
+    const bubble = h('div', 'bubble' + (m.photo ? ' has-photo' : m.video ? ' has-video' : ''));
+    if (m.replyTo) bubble.append(quoteBlock(m));
+
+    if (m.photo) {
+      const img = document.createElement('img');
+      img.className = 'msg-photo';
+      img.src = m.photo;
+      img.alt = 'Photo';
+      img.loading = 'lazy';
+      img.addEventListener('click', (e) => { e.stopPropagation(); openLightbox(m.photo); });
+      bubble.append(img);
+    }
+    if (m.video) {
+      const vid = document.createElement('video');
+      vid.className = 'msg-video';
+      vid.src = m.video;
+      vid.controls = true;
+      vid.playsInline = true;
+      vid.addEventListener('click', (e) => e.stopPropagation());
+      bubble.append(vid);
+    }
+    if (m.text) {
+      const text = h('span', 'text');
+      linkify(text, m.text);
+      bubble.append(text);
+    }
+
+    const meta = h('span', 'meta' + ((m.photo || m.video) && !m.text ? ' on-photo' : ''));
+    const time = document.createElement('time');
+    time.dateTime = new Date(m.ts).toISOString();
+    time.textContent = fmtTime(m.ts);
+    meta.append(time);
+
+    let tick = null;
+    if (mine) {
+      tick = h('span', 'tick' + (m.seen ? ' seen' : ''));
+      tick.innerHTML = m.seen ? TICK2 : TICK1; // static SVG strings only
+      meta.append(tick);
+    }
+    bubble.append(meta);
+
+    row.append(bubble);
+    attachDragToReply(row, bubble, m);
+    el.list.append(row);
+    nodes.set(m.id, { row, tick });
+    prev = m;
+  }
+
+  /* ------------------------------------------------------------- drag-to-reply */
+  function attachDragToReply(row, bubble, m) {
+    const THRESHOLD = 56, MAX = 80;
+    const mine = row.classList.contains('out'); // mine (right-aligned): drag left. theirs: drag right.
+    let active = false, dragging = false, startX = 0, startY = 0, pointerId = null;
+    const hint = h('span', 'reply-hint');
+    hint.innerHTML = REPLY_ICON;
+    row.append(hint);
+
+    function onMove(e) {
+      if (!active) return;
+      const mdx = e.clientX - startX, mdy = e.clientY - startY;
+      if (!dragging) {
+        if (Math.abs(mdx) < 6 && Math.abs(mdy) < 6) return;
+        if (Math.abs(mdy) > Math.abs(mdx)) { active = false; return; } // a vertical drag is scrolling, not a reply
+        dragging = true;
+        row.classList.add('dragging');
+        // only grab the pointer once a real drag starts, so a plain tap on a link/photo/quote
+        // still reaches its own click handler instead of being captured by the row
+        try { row.setPointerCapture(pointerId); } catch { /* ignore */ }
+      }
+      const raw = mine ? -mdx : mdx; // how far it has moved toward the reply-hint side
+      const amount = Math.max(0, Math.min(MAX, raw));
+      bubble.style.transform = `translateX(${mine ? -amount : amount}px)`;
+      row.classList.toggle('past-threshold', amount > THRESHOLD);
+    }
+    function onUp() {
+      if (!active) return;
+      active = false;
+      if (pointerId != null) { try { row.releasePointerCapture(pointerId); } catch { /* ignore */ } }
+      row.removeEventListener('pointermove', onMove);
+      row.removeEventListener('pointerup', onUp);
+      row.removeEventListener('pointercancel', onUp);
+      const passed = row.classList.contains('past-threshold');
+      row.classList.remove('dragging', 'past-threshold');
+      bubble.style.transform = '';
+      if (dragging && passed) setReply(m);
+      dragging = false;
+    }
+    row.addEventListener('pointerdown', (e) => {
+      if (e.button != null && e.button !== 0) return;
+      if (e.target.closest('a, button, .quote')) return;
+      active = true; dragging = false; startX = e.clientX; startY = e.clientY; pointerId = e.pointerId;
+      row.addEventListener('pointermove', onMove);
+      row.addEventListener('pointerup', onUp);
+      row.addEventListener('pointercancel', onUp);
+    });
+  }
+
+  function setReply(m) {
+    replyTarget = m;
+    const c = chats.get(openId);
+    el.replyName.textContent = m.from === me.id ? 'Replying to yourself' : `Replying to ${c ? c.peer.username : ''}`;
+    el.replySnippet.textContent = m.photo ? '📷 Photo' : m.video ? '🎥 Video' : m.text.slice(0, 100);
+    el.replyBar.classList.remove('hidden');
+    if (!coarse) el.input.focus();
+  }
+  function clearReply() {
+    replyTarget = null;
+    el.replyBar.classList.add('hidden');
+  }
+
+  function onMessage(chatId, m) {
+    const c = chats.get(chatId);
+    if (!c) return;
+    let arr = cache.get(chatId);
+    if (!arr) cache.set(chatId, (arr = []));
+    if (arr.some((x) => x.id === m.id)) return; // POST reply and stream echo both arrive
+
+    const viewing = chatId === openId && loaded.has(chatId);
+    const stick = viewing && atBottom();
+    const last = arr[arr.length - 1];
+    arr.push(m);
+    c.last = { text: (m.photo || m.video) ? '' : m.text.slice(0, 120), photo: !!m.photo, video: !!m.video, ts: m.ts, from: m.from };
+    c.updated = m.ts;
+
+    if (viewing) {
+      if (last && m.id < last.id) { arr.sort((a, b) => a.id - b.id); renderAll(); }
+      else appendMsg(m, true);
+    }
+
+    if (m.from === me.id) { if (viewing) scrollBottom(true); renderList(); return; }
+
+    if (typingIn.get(chatId)) { typingIn.set(chatId, false); if (viewing) renderHeader(); }
+    if (viewing && stick && visibleFocus()) { scrollBottom(true); renderList(); markSeen(); }
+    else { c.unread++; renderList(); notify(c.peer.username, m.photo ? '📷 Photo' : m.video ? '🎥 Video' : m.text); }
+  }
+
+  function applySeen(chatId, by, upTo, unread) {
+    const c = chats.get(chatId);
+    if (!c) return;
+    if (by === me.id) {
+      lastSeenSent.set(chatId, Math.max(lastSeenSent.get(chatId) || 0, upTo));
+      c.unread = unread;
+      renderList();
+      return;
+    }
+    for (const m of cache.get(chatId) || []) {
+      if (m.from === by || m.id > upTo || m.seen) continue;
+      m.seen = true;
+      const n = chatId === openId ? nodes.get(m.id) : null;
+      if (n && n.tick) { n.tick.classList.add('seen'); n.tick.innerHTML = TICK2; }
+    }
+  }
+
+  function markSeen() {
+    const c = chats.get(openId);
+    if (!c || c.status !== 'active' || !loaded.has(openId) || !visibleFocus() || !atBottom()) return;
+    if (c.unread) { c.unread = 0; renderList(); }
+    updateUnreadUi();
+    const msgs = cache.get(openId) || [];
+    let top = 0;
+    for (let i = msgs.length - 1; i >= 0; i--) if (msgs[i].from !== me.id) { top = msgs[i].id; break; }
+    const sent = lastSeenSent.get(openId) || 0;
+    if (top > sent) {
+      const id = openId;
+      lastSeenSent.set(id, top);
+      api('/api/seen', { chatId: id, upTo: top }).catch(() => { if (lastSeenSent.get(id) === top) lastSeenSent.set(id, sent); });
+    }
+  }
+
+  function notify(title, body) {
+    if (!('Notification' in window) || Notification.permission !== 'granted' || visibleFocus()) return;
+    try {
+      const n = new Notification(title, { body: String(body).slice(0, 140), tag: 'chat' });
+      n.onclick = () => { window.focus(); n.close(); };
+    } catch { /* some browsers only allow notifications from a service worker */ }
+  }
+
+  /* --------------------------------------------------------------------- photos */
+  function openLightbox(src) {
+    el.lightboxImg.src = src;
+    el.lightbox.classList.remove('hidden');
+  }
+  function closeLightbox() {
+    el.lightbox.classList.add('hidden');
+    el.lightboxImg.src = '';
+  }
+
+  function clearPhoto() {
+    pendingPhoto = null;
+    el.photoPreview.classList.add('hidden');
+    el.photoPreviewImg.src = '';
+    el.photoInput.value = '';
+  }
+
+  // Shrinks and recompresses a drawable source (an <img> or a <video> frame) until the
+  // resulting data URL fits the server's limit. Shared by file uploads and camera captures.
+  function compressDrawable(source, naturalW, naturalH, limit) {
+    let w = naturalW, hgt = naturalH;
+    const MAX_DIM = 1600;
+    if (Math.max(w, hgt) > MAX_DIM) { const s = MAX_DIM / Math.max(w, hgt); w = Math.round(w * s); hgt = Math.round(hgt * s); }
+    const canvas = document.createElement('canvas');
+    canvas.width = w; canvas.height = hgt;
+    canvas.getContext('2d').drawImage(source, 0, 0, w, hgt);
+    let quality = 0.82;
+    let out = canvas.toDataURL('image/jpeg', quality);
+    while (out.length > limit && quality > 0.35) { quality -= 0.12; out = canvas.toDataURL('image/jpeg', quality); }
+    while (out.length > limit && Math.max(w, hgt) > 480) {
+      w = Math.round(w * 0.85); hgt = Math.round(hgt * 0.85);
+      canvas.width = w; canvas.height = hgt;
+      canvas.getContext('2d').drawImage(source, 0, 0, w, hgt);
+      out = canvas.toDataURL('image/jpeg', quality);
+    }
+    if (out.length > limit) throw new Error('That photo is too large, even after shrinking it.');
+    return out;
+  }
+
+  function compressImage(file) {
+    return new Promise((resolve, reject) => {
+      const img = new Image();
+      const url = URL.createObjectURL(file);
+      img.onload = () => {
+        URL.revokeObjectURL(url);
+        try { resolve(compressDrawable(img, img.naturalWidth, img.naturalHeight, 400000)); }
+        catch (err) { reject(err); }
+      };
+      img.onerror = () => { URL.revokeObjectURL(url); reject(new Error("That file couldn't be read as a photo.")); };
+      img.src = url;
+    });
+  }
+
+  async function handlePhotoPick(file) {
+    if (!file) return;
+    if (!file.type.startsWith('image/')) { toast('Please choose an image file.'); return; }
+    try {
+      const dataUrl = await compressImage(file);
+      pendingPhoto = dataUrl;
+      el.photoPreviewImg.src = dataUrl;
+      el.photoPreview.classList.remove('hidden');
+      if (!coarse) el.input.focus();
+    } catch (err) { toast(err.message); }
+  }
+
+  /* --------------------------------------------------------------------- videos */
+  // Kept intentionally tiny (a few seconds, no audio, low resolution) so it fits the
+  // free-tier storage budget alongside photos — see README's storage notes.
+  const VIDEO_LIMIT = 450000;    // must match the server's MAX_VIDEO
+  const VIDEO_SECONDS = 8;
+  const VIDEO_WIDTH = 480;
+
+  function clearVideo() {
+    pendingVideo = null;
+    el.videoPreview.classList.add('hidden');
+    el.videoPreviewEl.src = '';
+    el.videoInput.value = '';
+  }
+
+  function compressVideo(file) {
+    return new Promise((resolve, reject) => {
+      if (!window.MediaRecorder || !HTMLCanvasElement.prototype.captureStream) {
+        reject(new Error("Sending videos isn't supported in this browser."));
+        return;
+      }
+      const url = URL.createObjectURL(file);
+      const v = document.createElement('video');
+      v.muted = true; v.playsInline = true; v.src = url;
+      let settled = false;
+      const fail = (err) => { if (settled) return; settled = true; URL.revokeObjectURL(url); reject(err); };
+
+      v.addEventListener('loadedmetadata', () => {
+        const scale = Math.min(1, VIDEO_WIDTH / v.videoWidth);
+        const w = Math.max(2, Math.round(v.videoWidth * scale)), hgt = Math.max(2, Math.round(v.videoHeight * scale));
+        const canvas = document.createElement('canvas');
+        canvas.width = w; canvas.height = hgt;
+        const ctx = canvas.getContext('2d');
+        const canvasStream = canvas.captureStream(20);
+        const mixed = new MediaStream(canvasStream.getVideoTracks());
+        const mimeType = ['video/webm;codecs=vp8', 'video/webm'].find((t) => MediaRecorder.isTypeSupported(t));
+        if (!mimeType) { fail(new Error("Sending videos isn't supported in this browser.")); return; }
+        let rec;
+        try { rec = new MediaRecorder(mixed, { mimeType, videoBitsPerSecond: 160000 }); }
+        catch { fail(new Error("Sending videos isn't supported in this browser.")); return; }
+        const chunks = [];
+        let frame = null, stopTimer = null;
+        rec.ondataavailable = (e) => { if (e.data.size) chunks.push(e.data); };
+        rec.onstop = () => {
+          if (settled) return; settled = true;
+          URL.revokeObjectURL(url);
+          const blob = new Blob(chunks, { type: mimeType });
+          const reader = new FileReader();
+          reader.onload = () => {
+            const out = reader.result;
+            if (out.length > VIDEO_LIMIT) reject(new Error('That video is too large, even after shrinking it — try a shorter clip.'));
+            else resolve(out);
+          };
+          reader.onerror = () => reject(new Error("That video couldn't be read."));
+          reader.readAsDataURL(blob);
+        };
+        function stop() {
+          clearTimeout(stopTimer);
+          if (frame != null) cancelAnimationFrame(frame);
+          v.pause();
+          if (rec.state !== 'inactive') rec.stop();
+        }
+        const draw = () => { ctx.drawImage(v, 0, 0, w, hgt); frame = requestAnimationFrame(draw); };
+        v.addEventListener('ended', stop);
+        v.play().then(() => {
+          rec.start();
+          draw();
+          stopTimer = setTimeout(stop, Math.min(v.duration || VIDEO_SECONDS, VIDEO_SECONDS) * 1000);
+        }).catch(() => fail(new Error("That video couldn't be played back.")));
+      });
+      v.addEventListener('error', () => fail(new Error("That file couldn't be read as a video.")));
+    });
+  }
+
+  async function handleVideoPick(file) {
+    if (!file) return;
+    if (!file.type.startsWith('video/')) { toast('Please choose a video file.'); return; }
+    toast('Preparing video…');
+    try {
+      const dataUrl = await compressVideo(file);
+      pendingVideo = dataUrl;
+      el.videoPreviewEl.src = dataUrl;
+      el.videoPreview.classList.remove('hidden');
+      if (!coarse) el.input.focus();
+    } catch (err) { toast(err.message); }
+  }
+
+  /* --------------------------------------------------------------------- camera */
+  let cameraStream = null;
+  let cameraFacing = 'user';
+
+  async function openCamera() {
+    if (!navigator.mediaDevices || !navigator.mediaDevices.getUserMedia) { toast('Camera is not available in this browser.'); return; }
+    el.cameraScreen.classList.remove('hidden');
+    try {
+      cameraStream = await navigator.mediaDevices.getUserMedia({ video: { facingMode: cameraFacing }, audio: false });
+      el.cameraVideo.srcObject = cameraStream;
+    } catch {
+      toast("Couldn't access your camera.");
+      closeCamera();
+    }
+  }
+  function closeCamera() {
+    if (cameraStream) { for (const t of cameraStream.getTracks()) t.stop(); cameraStream = null; }
+    el.cameraVideo.srcObject = null;
+    el.cameraScreen.classList.add('hidden');
+  }
+  async function flipCamera() {
+    cameraFacing = cameraFacing === 'user' ? 'environment' : 'user';
+    if (cameraStream) for (const t of cameraStream.getTracks()) t.stop();
+    try {
+      cameraStream = await navigator.mediaDevices.getUserMedia({ video: { facingMode: cameraFacing }, audio: false });
+      el.cameraVideo.srcObject = cameraStream;
+    } catch { toast('Only one camera is available.'); }
+  }
+  function captureCamera() {
+    const v = el.cameraVideo;
+    if (!v.videoWidth) return;
+    try {
+      const dataUrl = compressDrawable(v, v.videoWidth, v.videoHeight, 400000);
+      pendingPhoto = dataUrl;
+      el.photoPreviewImg.src = dataUrl;
+      el.photoPreview.classList.remove('hidden');
+      closeCamera();
+      if (!coarse) el.input.focus();
+    } catch (err) { toast(err.message); }
+  }
+
+  /* ------------------------------------------------------------------ wallpaper */
+  // Local to this device only: a per-chat background doesn't need to sync or take up
+  // server storage, and it matches how most chat apps already treat wallpaper.
+  const WALLPAPER_PRESETS = [
+    { id: 'default', label: 'Default', css: null },
+    { id: 'violet', label: 'Violet', css: 'radial-gradient(circle at 20% 15%, rgba(167,139,250,.16), transparent 55%), radial-gradient(circle at 85% 80%, rgba(123,97,219,.14), transparent 55%)' },
+    { id: 'midnight', label: 'Midnight', css: 'linear-gradient(165deg, #0d1522, #141027)' },
+    { id: 'rose', label: 'Rose', css: 'radial-gradient(circle at 80% 10%, rgba(236,120,150,.15), transparent 50%), radial-gradient(circle at 10% 90%, rgba(167,139,250,.12), transparent 55%)' },
+    { id: 'forest', label: 'Forest', css: 'radial-gradient(circle at 15% 20%, rgba(90,190,140,.14), transparent 50%), linear-gradient(165deg, #0c1712, #0f1a1c)' },
+  ];
+
+  function wallpaperKey(chatId) { return 'chat.wallpaper.' + chatId; }
+  function getWallpaper(chatId) {
+    try { const v = store.get(wallpaperKey(chatId)); return v ? JSON.parse(v) : null; } catch { return null; }
+  }
+  function setWallpaper(chatId, value) {
+    try { value ? store.set(wallpaperKey(chatId), JSON.stringify(value)) : store.del(wallpaperKey(chatId)); } catch { /* ignore */ }
+  }
+  function applyWallpaper(chatId) {
+    const w = getWallpaper(chatId);
+    if (!w) { el.list.style.backgroundImage = ''; return; }
+    el.list.style.backgroundImage = w.type === 'custom' ? `url("${w.value}")` : w.value;
+    el.list.style.backgroundSize = w.type === 'custom' ? 'cover' : 'auto';
+    el.list.style.backgroundPosition = 'center';
+  }
+  function closeWallpaperPicker() { el.wallpaperPicker.classList.add('hidden'); }
+  function renderWallpaperPicker() {
+    el.wallpaperSwatches.replaceChildren();
+    const current = getWallpaper(openId);
+    for (const p of WALLPAPER_PRESETS) {
+      const sw = h('button', 'swatch' + (!current && p.id === 'default' ? ' active' : (current && current.type === 'preset' && current.id === p.id ? ' active' : '')));
+      sw.type = 'button';
+      sw.title = p.label;
+      sw.style.background = p.css || 'linear-gradient(165deg, #1a1726, #241f38)';
+      sw.addEventListener('click', () => {
+        setWallpaper(openId, p.id === 'default' ? null : { type: 'preset', id: p.id, value: p.css });
+        applyWallpaper(openId);
+        renderWallpaperPicker();
+      });
+      el.wallpaperSwatches.append(sw);
+    }
+  }
+  async function handleWallpaperUpload(file) {
+    if (!file || !openId) return;
+    if (!file.type.startsWith('image/')) { toast('Please choose an image file.'); return; }
+    try {
+      const dataUrl = await compressImage(file);
+      setWallpaper(openId, { type: 'custom', value: dataUrl });
+      applyWallpaper(openId);
+      renderWallpaperPicker();
+      closeWallpaperPicker();
+    } catch (err) { toast(err.message); }
+  }
+
+  /* ------------------------------------------------------------------ typing */
+  function onTyping() {
+    if (!el.input.value.trim()) { stopTyping(); return; }
+    const now = Date.now();
+    if (!iAmTyping || now - lastTypingSent > 2500) {
+      iAmTyping = true;
+      lastTypingSent = now;
+      api('/api/typing', { chatId: openId, typing: true }).catch(() => {});
+    }
+    clearTimeout(typingStopTimer);
+    typingStopTimer = setTimeout(stopTyping, 3000);
+  }
+  let typingChat = null;
+  function stopTyping() {
+    clearTimeout(typingStopTimer);
+    if (iAmTyping) { iAmTyping = false; api('/api/typing', { chatId: typingChat || openId, typing: false }).catch(() => {}); }
+  }
+
+  /* -------------------------------------------------------------- connection */
+  function disconnect() {
+    if (source) { source.close(); source = null; }
+  }
+
+  function connect() {
+    disconnect();
+    setBanner('Connecting…');
+    const es = new EventSource('/api/stream?token=' + encodeURIComponent(token));
+    source = es;
+    lastPing = Date.now();
+    const on = (name, fn) => es.addEventListener(name, (e) => { lastPing = Date.now(); fn(JSON.parse(e.data)); });
+
+    on('init', onInit);
+    on('chat', upsertChat);
+    on('chatRemoved', (d) => removeChat(d.chatId));
+    on('chatCleared', clearChatLocal);
+    on('msg', (d) => onMessage(d.chatId, d.message));
+    on('seen', (d) => applySeen(d.chatId, d.by, d.upTo, d.unread));
+    on('typing', (d) => {
+      typingIn.set(d.chatId, !!d.typing);
+      clearTimeout(typingTimers.get(d.chatId));
+      if (d.typing) typingTimers.set(d.chatId, setTimeout(() => { typingIn.set(d.chatId, false); if (d.chatId === openId) renderHeader(); renderList(); }, 5000));
+      if (d.chatId === openId) renderHeader();
+      renderList();
+    });
+    on('presence', (d) => {
+      for (const c of chats.values()) {
+        if (c.peer.id !== d.userId) continue;
+        c.peer.online = d.online;
+        c.peer.lastSeen = d.lastSeen;
+        if (!d.online) typingIn.set(c.id, false);
+      }
+      if (openId) renderHeader();
+      renderList();
+    });
+    on('call', onCallSignal);
+    on('kicked', (d) => signOut(d.reason || 'Your session was ended.'));
+    on('ping', () => {});
+    es.onopen = () => setBanner('');
+    es.onerror = () => {
+      if (es !== source) return;
+      setBanner('Reconnecting…');
+      // The browser retries by itself, unless the response was a hard failure (CLOSED).
+      if (es.readyState === EventSource.CLOSED) recover();
+    };
+  }
+
+  async function recover() {
+    if (recovering || !token) return;
+    recovering = true;
+    try {
+      await api('/api/ping'); // 401 here signs us out; any other error means "server not back yet"
+      recovering = false;
+      connect();
+    } catch (e) {
+      recovering = false;
+      if (e.status !== 401 && token) setTimeout(recover, 3000);
+    }
+  }
+
+  function onInit(d) {
+    me = d.me;
+    chats.clear();
+    for (const c of d.chats) chats.set(c.id, c);
+    // history may have changed while we were away: refetch lazily
+    cache.clear(); loaded.clear(); typingIn.clear();
+    el.meName.textContent = me.username;
+    paintAvatar(el.meAvatar, me.username);
+    showApp();
+    setBanner('');
+    renderList();
+    if (openId && chats.has(openId)) { nodes = new Map(); prev = null; refreshConvo(); }
+    else if (openId) closeConvo();
+  }
+
+  /* ----------------------------------------------------------------- screens */
+  function showApp() {
+    el.login.classList.add('hidden');
+    el.chat.classList.remove('hidden');
+  }
+
+  function setMode(mode) {
+    authMode = mode;
+    const signup = mode === 'signup';
+    el.tabLogin.classList.toggle('active', !signup);
+    el.tabSignup.classList.toggle('active', signup);
+    el.tabLogin.setAttribute('aria-selected', String(!signup));
+    el.tabSignup.setAttribute('aria-selected', String(signup));
+    el.formTitle.textContent = signup ? 'Create your account.' : 'Welcome back.';
+    el.formSub.textContent = signup ? 'Choose a username people can find you by.' : 'Log in to see your conversations.';
+    el.joinLabel.textContent = signup ? 'Create account' : 'Log in';
+    el.usernameHint.classList.toggle('hidden', !signup);
+    el.passwordHint.classList.toggle('hidden', !signup);
+    el.password.autocomplete = signup ? 'new-password' : 'current-password';
+    el.password.minLength = signup ? 8 : 0;
+    el.password.placeholder = signup ? 'At least 8 characters' : 'Your password';
+    el.loginError.textContent = '';
+  }
+
+  function showLogin(message) {
+    el.chat.classList.add('hidden');
+    el.login.classList.remove('hidden');
+    setMode('login');
+    el.loginError.textContent = message || '';
+    el.username.value = store.get('chat.username') || '';
+    el.password.value = '';
+    (el.username.value ? el.password : el.username).focus();
+  }
+
+  function signOut(message) {
+    endCall(true);
+    closeCamera();
+    closeWallpaperPicker();
+    disconnect();
+    token = null;
+    store.del('chat.token');
+    me = null; openId = null; nodes = new Map(); prev = null;
+    chats.clear(); cache.clear(); loaded.clear(); lastSeenSent.clear(); typingIn.clear();
+    clearSearch(); clearReply(); clearPhoto(); clearVideo();
+    el.list.replaceChildren();
+    el.list.style.backgroundImage = '';
+    el.convo.classList.add('hidden');
+    el.noChat.classList.remove('hidden');
+    el.frame.dataset.view = 'list';
+    document.title = TITLE;
+    showLogin(message);
+  }
+
+  /* ========================================================================
+     Calls: audio/video is peer-to-peer (WebRTC). The server only relays the
+     short setup messages (offer / answer / ICE candidates) between the two
+     phones over the realtime stream already used for chat. No TURN relay is
+     configured, so a call may fail to connect on some mobile networks.
+  ========================================================================= */
+  const ICE_SERVERS = [{ urls: ['stun:stun.l.google.com:19302', 'stun:stun1.l.google.com:19302'] }];
+
+  let pc = null;
+  let localStream = null;
+  let callChatId = null;
+  let callState = 'idle'; // idle | calling | ringing | active
+  let callIsVideo = false;
+  let pendingCandidates = [];
+  let callTimeout = null;
+
+  function callPeerUsername() {
+    const c = chats.get(callChatId);
+    return c ? c.peer.username : '';
+  }
+
+  function showCallScreen(status, { incoming: isIncoming = false, active = false } = {}) {
+    el.callScreen.classList.remove('hidden');
+    el.callName.textContent = callPeerUsername();
+    el.callStatus.textContent = status;
+    paintAvatar(el.callAvatar, callPeerUsername() || '?');
+    el.callIncoming.classList.toggle('hidden', !isIncoming);
+    el.callActive.classList.toggle('hidden', !active);
+    el.callCam.classList.toggle('hidden', !callIsVideo);
+  }
+  function hideCallScreen() {
+    el.callScreen.classList.add('hidden');
+    el.remoteVideo.srcObject = null;
+    el.localVideo.srcObject = null;
+    el.localVideo.classList.add('hidden');
+    el.callAvatarWrap.classList.remove('hidden');
+  }
+
+  function stopLocalStream() {
+    if (localStream) { for (const t of localStream.getTracks()) t.stop(); localStream = null; }
+  }
+
+  function teardownCall() {
+    clearTimeout(callTimeout);
+    if (pc) { try { pc.close(); } catch { /* ignore */ } pc = null; }
+    stopLocalStream();
+    pendingCandidates = [];
+    callState = 'idle';
+    callChatId = null;
+    hideCallScreen();
+  }
+
+  function sendCall(chatId, type, data) {
+    return api('/api/call', { chatId, type, data }).catch((err) => { toast(err.message); });
+  }
+
+  async function startCall(video) {
+    const c = chats.get(openId);
+    if (!c || c.status !== 'active') return;
+    if (callState !== 'idle') { toast('Finish or end your current call first.'); return; }
+    if (!c.peer.online) { toast(`${c.peer.username} is offline right now.`); return; }
+    callChatId = openId;
+    callIsVideo = video;
+    callState = 'calling';
+    showCallScreen('Calling…', { active: false });
+    try {
+      localStream = await navigator.mediaDevices.getUserMedia({ audio: true, video });
+    } catch {
+      toast(video ? "Couldn't access your camera/microphone." : "Couldn't access your microphone.");
+      teardownCall();
+      return;
+    }
+    setupLocalPreview();
+    pc = new RTCPeerConnection({ iceServers: ICE_SERVERS });
+    wirePeerConnection();
+    for (const t of localStream.getTracks()) pc.addTrack(t, localStream);
+    const offer = await pc.createOffer();
+    await pc.setLocalDescription(offer);
+    await sendCall(callChatId, 'offer', { sdp: offer.sdp, video });
+    callTimeout = setTimeout(() => { if (callState === 'calling') { toast('No answer.'); sendCall(callChatId, 'end'); teardownCall(); } }, 45000);
+  }
+
+  function setupLocalPreview() {
+    el.localVideo.srcObject = localStream;
+    el.localVideo.classList.toggle('hidden', !callIsVideo);
+    el.callAvatarWrap.classList.toggle('hidden', callIsVideo);
+  }
+
+  function wirePeerConnection() {
+    pc.onicecandidate = (e) => { if (e.candidate && callChatId) sendCall(callChatId, 'ice', e.candidate.toJSON()); };
+    pc.ontrack = (e) => {
+      if (el.remoteVideo.srcObject !== e.streams[0]) el.remoteVideo.srcObject = e.streams[0];
+      callState = 'active';
+      showCallScreen(callIsVideo ? 'Video call' : 'Audio call', { active: true });
+      clearTimeout(callTimeout);
+    };
+    pc.onconnectionstatechange = () => {
+      if (pc && (pc.connectionState === 'failed' || pc.connectionState === 'closed')) {
+        if (callState !== 'idle') { toast('Call connection lost.'); teardownCall(); }
+      }
+    };
+  }
+
+  async function onCallSignal(d) {
+    if (d.type === 'offer') {
+      if (callState !== 'idle') { sendCall(d.chatId, 'busy'); return; }
+      if (!chats.has(d.chatId)) return;
+      callChatId = d.chatId;
+      callIsVideo = !!d.data.video;
+      callState = 'ringing';
+      pendingOffer = d.data;
+      showCallScreen(callIsVideo ? 'Incoming video call' : 'Incoming call', { incoming: true });
+      callTimeout = setTimeout(() => { if (callState === 'ringing') { sendCall(callChatId, 'decline'); teardownCall(); } }, 45000);
+      return;
+    }
+    if (d.chatId !== callChatId) return; // a message for some other call
+    if (d.type === 'answer') {
+      if (!pc) return;
+      clearTimeout(callTimeout);
+      await pc.setRemoteDescription({ type: 'answer', sdp: d.data.sdp });
+      await flushCandidates();
+      return;
+    }
+    if (d.type === 'ice') {
+      if (pc && pc.remoteDescription) { try { await pc.addIceCandidate(d.data); } catch { /* ignore */ } }
+      else pendingCandidates.push(d.data);
+      return;
+    }
+    if (d.type === 'end') { toast(`${callPeerUsername()} ended the call.`); teardownCall(); return; }
+    if (d.type === 'decline') { toast(`${callPeerUsername()} declined the call.`); teardownCall(); return; }
+    if (d.type === 'busy') { toast(`${callPeerUsername()} is already on a call.`); teardownCall(); return; }
+  }
+
+  async function flushCandidates() {
+    for (const c of pendingCandidates) { try { await pc.addIceCandidate(c); } catch { /* ignore */ } }
+    pendingCandidates = [];
+  }
+
+  let pendingOffer = null;
+  async function acceptCall() {
+    if (callState !== 'ringing' || !pendingOffer) return;
+    clearTimeout(callTimeout);
+    try {
+      localStream = await navigator.mediaDevices.getUserMedia({ audio: true, video: callIsVideo });
+    } catch {
+      toast(callIsVideo ? "Couldn't access your camera/microphone." : "Couldn't access your microphone.");
+      sendCall(callChatId, 'decline');
+      teardownCall();
+      return;
+    }
+    setupLocalPreview();
+    pc = new RTCPeerConnection({ iceServers: ICE_SERVERS });
+    wirePeerConnection();
+    for (const t of localStream.getTracks()) pc.addTrack(t, localStream);
+    await pc.setRemoteDescription({ type: 'offer', sdp: pendingOffer.sdp });
+    await flushCandidates();
+    const answer = await pc.createAnswer();
+    await pc.setLocalDescription(answer);
+    await sendCall(callChatId, 'answer', { sdp: answer.sdp });
+    callState = 'active';
+    showCallScreen(callIsVideo ? 'Video call' : 'Audio call', { active: true });
+    pendingOffer = null;
+  }
+
+  function declineCall() {
+    if (callChatId) sendCall(callChatId, 'decline');
+    teardownCall();
+  }
+
+  function endCall() {
+    if (callChatId) sendCall(callChatId, 'end');
+    teardownCall();
+  }
+
+  let micOn = true, camOn = true;
+  function toggleMic() {
+    if (!localStream) return;
+    micOn = !micOn;
+    for (const t of localStream.getAudioTracks()) t.enabled = micOn;
+    el.callMic.classList.toggle('off', !micOn);
+  }
+  function toggleCam() {
+    if (!localStream || !callIsVideo) return;
+    camOn = !camOn;
+    for (const t of localStream.getVideoTracks()) t.enabled = camOn;
+    el.callCam.classList.toggle('off', !camOn);
+  }
+
+  el.audioCallBtn.addEventListener('click', () => startCall(false));
+  el.videoCallBtn.addEventListener('click', () => startCall(true));
+  el.callAccept.addEventListener('click', acceptCall);
+  el.callDecline.addEventListener('click', declineCall);
+  el.callEnd.addEventListener('click', endCall);
+  el.callMic.addEventListener('click', toggleMic);
+  el.callCam.addEventListener('click', toggleCam);
+
+  /* ------------------------------------------------------------------ events */
+  el.tabLogin.addEventListener('click', () => setMode('login'));
+  el.tabSignup.addEventListener('click', () => setMode('signup'));
+
+  el.loginForm.addEventListener('submit', async (e) => {
+    e.preventDefault();
+    el.loginError.textContent = '';
+    el.joinBtn.disabled = true;
+    if ('Notification' in window && Notification.permission === 'default') {
+      try { Notification.requestPermission().catch(() => {}); } catch { /* old Safari */ }
+    }
+    try {
+      token = null;
+      const r = await api(authMode === 'signup' ? '/api/signup' : '/api/login', { username: el.username.value, password: el.password.value });
+      token = r.token;
+      store.set('chat.token', token);
+      store.set('chat.username', r.username);
+      el.password.value = '';
+      connect();
+    } catch (err) {
+      el.loginError.textContent = err.message;
+    } finally {
+      el.joinBtn.disabled = false;
+    }
+  });
+
+  function autosize() {
+    el.input.style.height = 'auto';
+    el.input.style.height = Math.min(el.input.scrollHeight, 140) + 'px';
+  }
+
+  async function send() {
+    const text = el.input.value.trim();
+    const photo = pendingPhoto;
+    const video = pendingVideo;
+    const replyTo = replyTarget ? replyTarget.id : null;
+    const chatId = openId;
+    if ((!text && !photo && !video) || !me || !chatId) return;
+    el.input.value = '';
+    autosize();
+    el.sendBtn.disabled = true;
+    clearPhoto();
+    clearVideo();
+    clearReply();
+    stopTyping();
+    el.input.focus();
+    try {
+      const r = await api('/api/send', { chatId, text, photo, video, replyTo });
+      onMessage(chatId, r.message);
+    } catch (err) {
+      if (!el.input.value && chatId === openId) {
+        el.input.value = text; autosize(); el.sendBtn.disabled = false;
+        if (photo) { pendingPhoto = photo; el.photoPreviewImg.src = photo; el.photoPreview.classList.remove('hidden'); }
+        if (video) { pendingVideo = video; el.videoPreviewEl.src = video; el.videoPreview.classList.remove('hidden'); }
+        if (replyTo) { const m = findMsg(chatId, replyTo); if (m) setReply(m); }
+      }
+      toast(err.message);
+    }
+  }
+
+  el.input.addEventListener('input', () => {
+    autosize();
+    el.sendBtn.disabled = !el.input.value.trim() && !pendingPhoto && !pendingVideo;
+    typingChat = openId;
+    onTyping();
+  });
+  el.input.addEventListener('keydown', (e) => {
+    if (e.key === 'Enter' && !e.shiftKey && !e.isComposing && !coarse) { e.preventDefault(); send(); }
+  });
+  el.composer.addEventListener('submit', (e) => { e.preventDefault(); send(); });
+  el.sendBtn.addEventListener('mousedown', (e) => e.preventDefault()); // keep keyboard open
+
+  el.photoBtn.addEventListener('click', () => el.photoInput.click());
+  el.photoInput.addEventListener('change', () => {
+    const file = el.photoInput.files && el.photoInput.files[0];
+    handlePhotoPick(file).then(() => { el.sendBtn.disabled = !el.input.value.trim() && !pendingPhoto && !pendingVideo; });
+  });
+  el.photoCancel.addEventListener('click', () => { clearPhoto(); el.sendBtn.disabled = !el.input.value.trim() && !pendingVideo; });
+
+  el.videoBtn.addEventListener('click', () => el.videoInput.click());
+  el.videoInput.addEventListener('change', () => {
+    const file = el.videoInput.files && el.videoInput.files[0];
+    handleVideoPick(file).then(() => { el.sendBtn.disabled = !el.input.value.trim() && !pendingPhoto && !pendingVideo; });
+  });
+  el.videoCancel.addEventListener('click', () => { clearVideo(); el.sendBtn.disabled = !el.input.value.trim() && !pendingPhoto; });
+  el.replyCancel.addEventListener('click', clearReply);
+
+  el.lightbox.addEventListener('click', closeLightbox);
+  document.addEventListener('keydown', (e) => { if (e.key === 'Escape' && !el.lightbox.classList.contains('hidden')) closeLightbox(); });
+
+  el.cameraBtn.addEventListener('click', openCamera);
+  el.cameraClose.addEventListener('click', closeCamera);
+  el.cameraFlip.addEventListener('click', flipCamera);
+  el.cameraShutter.addEventListener('click', () => { captureCamera(); el.sendBtn.disabled = !el.input.value.trim() && !pendingPhoto && !pendingVideo; });
+
+  el.deleteChatBtn.addEventListener('click', async () => {
+    if (!openId) return;
+    const c = chats.get(openId);
+    const name = c ? c.peer.username : 'this person';
+    if (!confirm(`Delete your conversation with ${name}? You'll need to reconnect to chat with them again. This cannot be undone.`)) return;
+    el.deleteChatBtn.disabled = true;
+    try { await api('/api/deleteChat', { chatId: openId }); removeChat(openId); }
+    catch (err) { toast(err.message); }
+    finally { el.deleteChatBtn.disabled = false; }
+  });
+
+  el.wallpaperBtn.addEventListener('click', () => {
+    if (!openId) return;
+    const hidden = el.wallpaperPicker.classList.contains('hidden');
+    if (hidden) renderWallpaperPicker();
+    el.wallpaperPicker.classList.toggle('hidden', !hidden);
+  });
+  el.wallpaperUploadBtn.addEventListener('click', () => el.wallpaperInput.click());
+  el.wallpaperInput.addEventListener('change', () => {
+    const file = el.wallpaperInput.files && el.wallpaperInput.files[0];
+    handleWallpaperUpload(file);
+    el.wallpaperInput.value = '';
+  });
+  el.wallpaperResetBtn.addEventListener('click', () => {
+    if (!openId) return;
+    setWallpaper(openId, null);
+    applyWallpaper(openId);
+    renderWallpaperPicker();
+  });
+
+  el.search.addEventListener('input', onSearchInput);
+  el.search.addEventListener('keydown', (e) => { if (e.key === 'Escape') { clearSearch(); el.search.blur(); } });
+
+  el.list.addEventListener('scroll', () => { updateUnreadUi(); if (atBottom()) markSeen(); }, { passive: true });
+  el.toBottom.addEventListener('click', () => { scrollBottom(true); setTimeout(markSeen, 350); });
+
+  el.back.addEventListener('click', () => {
+    if (history.state && history.state.chat) history.back(); else closeConvo();
+  });
+  addEventListener('popstate', () => { if (openId) closeConvo(); });
+
+  el.logout.addEventListener('click', () => {
+    if (!confirm('Log out on this device? Your messages stay saved.')) return;
+    const p = api('/api/logout');
+    signOut('');
+    p.catch(() => {});
+  });
+
+  addEventListener('focus', markSeen);
+  addEventListener('online', () => { if (token) connect(); });
+  document.addEventListener('visibilitychange', () => {
+    if (document.visibilityState !== 'visible' || !token) return;
+    if (Date.now() - lastPing > 40000) connect(); // phone was asleep; the stream is probably dead
+    markSeen();
+  });
+
+  // Watchdog (server pings every 25s) and keeping "last seen" fresh
+  setInterval(() => {
+    if (token && source && Date.now() - lastPing > 60000) connect();
+    if (openId) renderHeader();
+  }, 15000);
+
+  /* -------------------------------------------------------------------- boot */
+  if (token) { el.login.classList.add('hidden'); setBanner('Connecting…'); connect(); }
+  else showLogin('');
+})();
