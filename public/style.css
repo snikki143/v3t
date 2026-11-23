@@ -416,7 +416,7 @@ button { color: inherit; }
   font-size: var(--size, 22px);
   opacity: 0;
   filter: drop-shadow(0 2px 6px rgba(0,0,0,.35));
-  animation: heart-rise var(--dur, 3.2s) ease-in var(--delay, 0s) forwards;
+  animation: heart-rise var(--dur, 9.2s) ease-in var(--delay, 0s) forwards;
   will-change: transform, opacity;
 }
 @keyframes heart-rise {
