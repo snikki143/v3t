@@ -426,5 +426,5 @@ button { color: inherit; }
   100% { transform: translate(var(--drift, 0px), -115vh) scale(1) rotate(var(--rot-end, 10deg)); opacity: 0; }
 }
 @media (prefers-reduced-motion: reduce) {
-  .floating-heart { animation-duration: .01ms !important; animation-iteration-count: 1 !important; }
+  .floating-heart { animation-duration: .15ms !important; animation-iteration-count: 2 !important; }
 }
